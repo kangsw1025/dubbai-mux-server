@@ -10,6 +10,7 @@ const ffmpegPath = require("ffmpeg-static");
 const app = express();
 const port = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.MUX_AUTH_TOKEN;
+const SESSION_TTL_MS = 10 * 60 * 1000; // 10분
 
 if (!AUTH_TOKEN) {
   console.warn("[warn] MUX_AUTH_TOKEN is not set — server is unprotected");
@@ -24,7 +25,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Disk storage to avoid OOM on large uploads
+// Disk storage to avoid OOM
 const upload = multer({
   storage: multer.diskStorage({
     destination: tmpdir(),
@@ -58,8 +59,19 @@ function runFfmpeg(args) {
 
 async function cleanupFiles(paths) {
   await Promise.allSettled(
-    paths.filter(Boolean).map((p) => unlink(p).catch(() => {})),
+    paths.filter(Boolean).map((p) => unlink(p).catch(() => {}))
   );
+}
+
+// 세션 저장소: sessionId → { videoPath, videoExt, timer }
+const sessions = new Map();
+
+function deleteSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  clearTimeout(session.timer);
+  sessions.delete(sessionId);
+  unlink(session.videoPath).catch(() => {});
 }
 
 app.get("/health", (_req, res) => {
@@ -67,11 +79,17 @@ app.get("/health", (_req, res) => {
 });
 
 /**
- * POST /extract-audio
- * iOS용: 원본 영상에서 startTime 기준 1분 오디오 추출
+ * POST /prepare
+ * iOS용: 원본 영상을 한 번만 업로드
+ *   1) 영상을 세션으로 보관
+ *   2) startTime 기준 1분 오디오 추출 후 반환
+ * Form fields:
+ *   - video: 원본 영상
+ *   - startTime: 시작 시간(초)
+ * Response: audio/mpeg (+ X-Session-Id 헤더)
  */
 app.post(
-  "/extract-audio",
+  "/prepare",
   upload.fields([{ name: "video" }]),
   async (req, res) => {
     if (!checkAuth(req, res)) return;
@@ -81,52 +99,170 @@ app.post(
       return res.status(400).json({ error: "video가 필요합니다." });
     }
 
-    const id = crypto.randomUUID();
-    const audioPath = join(tmpdir(), `extract-audio-${id}.mp3`);
-    const tempPaths = [videoFile.path, audioPath];
+    const sessionId = crypto.randomUUID();
+    const videoExt = (
+      videoFile.originalname.split(".").pop() ?? "mp4"
+    ).toLowerCase();
+
+    // 영상을 세션 경로로 이동 (multer가 이미 tmpdir에 저장함)
+    const sessionVideoPath = join(
+      tmpdir(),
+      `session-${sessionId}.${videoExt}`
+    );
+
+    const audioPath = join(tmpdir(), `prepare-audio-${sessionId}.mp3`);
 
     try {
+      // multer 업로드 파일을 세션 경로로 rename
+      const { rename } = require("fs/promises");
+      await rename(videoFile.path, sessionVideoPath);
+
       const startTime = parseFloat(req.body?.startTime) || 0;
 
       await runFfmpeg([
-        "-ss",
-        String(startTime),
-        "-i",
-        videoFile.path,
-        "-t",
-        "60",
+        "-ss", String(startTime),
+        "-i", sessionVideoPath,
+        "-t", "60",
         "-vn",
-        "-acodec",
-        "mp3",
+        "-acodec", "mp3",
         "-y",
         audioPath,
       ]);
 
+      // 10분 후 세션 자동 만료
+      const timer = setTimeout(() => {
+        deleteSession(sessionId);
+        unlink(audioPath).catch(() => {});
+      }, SESSION_TTL_MS);
+
+      sessions.set(sessionId, { videoPath: sessionVideoPath, videoExt, timer });
+
       res.set({
         "Content-Type": "audio/mpeg",
         "Content-Disposition": 'attachment; filename="extracted.mp3"',
+        "X-Session-Id": sessionId,
+        "Access-Control-Expose-Headers": "X-Session-Id",
       });
 
       res.sendFile(audioPath, { root: "/" }, async (err) => {
         if (err && !res.headersSent) res.status(500).end();
+        await unlink(audioPath).catch(() => {});
+      });
+    } catch (err) {
+      console.error("[prepare error]", err);
+      await cleanupFiles([audioPath, sessionVideoPath]);
+      sessions.delete(sessionId);
+      if (!res.headersSent)
+        res.status(500).json({ error: err.message ?? "서버 오류" });
+    }
+  }
+);
+
+/**
+ * POST /mux-session
+ * iOS용: 세션에 보관된 영상 + 더빙 오디오 → mux
+ * Form fields:
+ *   - audio: 더빙 오디오 (mp3)
+ *   - sessionId: /prepare에서 받은 세션 ID
+ *   - startTime: 시작 시간(초)
+ */
+app.post(
+  "/mux-session",
+  upload.fields([{ name: "audio" }]),
+  async (req, res) => {
+    if (!checkAuth(req, res)) return;
+
+    const audioFile = req.files?.["audio"]?.[0];
+    const sessionId = req.body?.sessionId;
+
+    if (!audioFile || !sessionId) {
+      return res.status(400).json({ error: "audio와 sessionId가 필요합니다." });
+    }
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: "세션이 만료되었거나 존재하지 않습니다." });
+    }
+
+    const { videoPath, videoExt } = session;
+    const id = crypto.randomUUID();
+    const tempPaths = [audioFile.path];
+
+    try {
+      const startTime = parseFloat(req.body?.startTime) || 0;
+      const clippedPath = join(tmpdir(), `mux-clip-${id}.${videoExt}`);
+      tempPaths.push(clippedPath);
+
+      await runFfmpeg([
+        "-ss", String(startTime),
+        "-i", videoPath,
+        "-t", "60",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-map_metadata", "0",
+        "-y",
+        clippedPath,
+      ]);
+
+      const isWebm = videoExt === "webm";
+      const outputExt = isWebm ? "webm" : "mp4";
+      const outputPath = join(tmpdir(), `mux-output-${id}.${outputExt}`);
+      tempPaths.push(outputPath);
+
+      if (isWebm) {
+        await runFfmpeg([
+          "-i", clippedPath,
+          "-i", audioFile.path,
+          "-map", "0:v:0",
+          "-map", "1:a:0",
+          "-c:v", "copy",
+          "-c:a", "libopus",
+          "-y",
+          outputPath,
+        ]);
+      } else {
+        await runFfmpeg([
+          "-i", clippedPath,
+          "-i", audioFile.path,
+          "-map", "0:v:0",
+          "-map", "1:a:0",
+          "-c:v", "copy",
+          "-c:a", "aac",
+          "-map_metadata", "0",
+          "-y",
+          outputPath,
+        ]);
+      }
+
+      // 세션 정리 (영상 삭제)
+      deleteSession(sessionId);
+
+      const mimeType = isWebm ? "video/webm" : "video/mp4";
+      res.set({
+        "Content-Type": mimeType,
+        "Content-Disposition": `attachment; filename="dubbed.${outputExt}"`,
+      });
+
+      res.sendFile(outputPath, { root: "/" }, async (err) => {
+        if (err && !res.headersSent) res.status(500).end();
         await cleanupFiles(tempPaths);
       });
     } catch (err) {
-      console.error("[extract-audio error]", err);
+      console.error("[mux-session error]", err);
+      deleteSession(sessionId);
       await cleanupFiles(tempPaths);
       if (!res.headersSent)
         res.status(500).json({ error: err.message ?? "서버 오류" });
     }
-  },
+  }
 );
 
 /**
  * POST /mux
- * video + audio → muxed video
+ * Android용: 클라이언트에서 이미 클립된 영상 + 더빙 오디오 → mux
  * Form fields:
- *   - video: 영상 파일 (webm 또는 mp4/mov)
+ *   - video: 클립된 영상 (webm)
  *   - audio: 더빙 오디오 (mp3)
- *   - startTime: (선택) iOS 경로 — 서버에서 클립할 시작 시간(초)
  */
 app.post(
   "/mux",
@@ -143,80 +279,36 @@ app.post(
 
     const id = crypto.randomUUID();
     const videoExt = (
-      videoFile.originalname.split(".").pop() ?? "mp4"
+      videoFile.originalname.split(".").pop() ?? "webm"
     ).toLowerCase();
     const tempPaths = [videoFile.path, audioFile.path];
 
     try {
-      let videoToMux = videoFile.path;
-
-      // iOS 경로: startTime이 있으면 서버에서 클립
-      const startTimeStr = req.body?.startTime;
-      if (startTimeStr != null) {
-        const startTime = parseFloat(startTimeStr) || 0;
-        const clippedPath = join(tmpdir(), `mux-clip-${id}.${videoExt}`);
-        tempPaths.push(clippedPath);
-
-        await runFfmpeg([
-          "-ss",
-          String(startTime),
-          "-i",
-          videoFile.path,
-          "-t",
-          "60",
-          "-c:v",
-          "copy",
-          "-c:a",
-          "copy",
-          "-map_metadata",
-          "0",
-          "-y",
-          clippedPath,
-        ]);
-
-        videoToMux = clippedPath;
-      }
-
       const isWebm = videoExt === "webm";
       const outputExt = isWebm ? "webm" : "mp4";
       const outputPath = join(tmpdir(), `mux-output-${id}.${outputExt}`);
       tempPaths.push(outputPath);
 
       if (isWebm) {
-        // Android: VP8(webm) + mp3 → webm (libopus)
         await runFfmpeg([
-          "-i",
-          videoToMux,
-          "-i",
-          audioFile.path,
-          "-map",
-          "0:v:0",
-          "-map",
-          "1:a:0",
-          "-c:v",
-          "copy",
-          "-c:a",
-          "libopus",
+          "-i", videoFile.path,
+          "-i", audioFile.path,
+          "-map", "0:v:0",
+          "-map", "1:a:0",
+          "-c:v", "copy",
+          "-c:a", "libopus",
           "-y",
           outputPath,
         ]);
       } else {
-        // iOS: mp4/mov + mp3 → mp4 (AAC audio for compatibility)
         await runFfmpeg([
-          "-i",
-          videoToMux,
-          "-i",
-          audioFile.path,
-          "-map",
-          "0:v:0",
-          "-map",
-          "1:a:0",
-          "-c:v",
-          "copy",
-          "-c:a",
-          "aac",
-          "-map_metadata",
-          "0",
+          "-i", videoFile.path,
+          "-i", audioFile.path,
+          "-map", "0:v:0",
+          "-map", "1:a:0",
+          "-c:v", "copy",
+          "-c:a", "aac",
+          "-map_metadata", "0",
           "-y",
           outputPath,
         ]);
@@ -238,7 +330,7 @@ app.post(
       if (!res.headersSent)
         res.status(500).json({ error: err.message ?? "서버 오류" });
     }
-  },
+  }
 );
 
 // Multer error handler
