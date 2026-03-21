@@ -5,6 +5,7 @@ const { unlink } = require("fs/promises");
 const { join } = require("path");
 const { tmpdir } = require("os");
 const crypto = require("crypto");
+const ffmpegPath = require("ffmpeg-static");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -44,7 +45,7 @@ function checkAuth(req, res) {
 
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("ffmpeg", args);
+    const proc = spawn(ffmpegPath, args);
     let stderr = "";
     proc.stderr.on("data", (d) => (stderr += d.toString()));
     proc.on("close", (code) => {
@@ -57,7 +58,7 @@ function runFfmpeg(args) {
 
 async function cleanupFiles(paths) {
   await Promise.allSettled(
-    paths.filter(Boolean).map((p) => unlink(p).catch(() => {}))
+    paths.filter(Boolean).map((p) => unlink(p).catch(() => {})),
   );
 }
 
@@ -88,11 +89,15 @@ app.post(
       const startTime = parseFloat(req.body?.startTime) || 0;
 
       await runFfmpeg([
-        "-ss", String(startTime),
-        "-i", videoFile.path,
-        "-t", "60",
+        "-ss",
+        String(startTime),
+        "-i",
+        videoFile.path,
+        "-t",
+        "60",
         "-vn",
-        "-acodec", "mp3",
+        "-acodec",
+        "mp3",
         "-y",
         audioPath,
       ]);
@@ -112,7 +117,7 @@ app.post(
       if (!res.headersSent)
         res.status(500).json({ error: err.message ?? "서버 오류" });
     }
-  }
+  },
 );
 
 /**
@@ -153,12 +158,18 @@ app.post(
         tempPaths.push(clippedPath);
 
         await runFfmpeg([
-          "-ss", String(startTime),
-          "-i", videoFile.path,
-          "-t", "60",
-          "-c:v", "copy",
-          "-c:a", "copy",
-          "-map_metadata", "0",
+          "-ss",
+          String(startTime),
+          "-i",
+          videoFile.path,
+          "-t",
+          "60",
+          "-c:v",
+          "copy",
+          "-c:a",
+          "copy",
+          "-map_metadata",
+          "0",
           "-y",
           clippedPath,
         ]);
@@ -174,25 +185,38 @@ app.post(
       if (isWebm) {
         // Android: VP8(webm) + mp3 → webm (libopus)
         await runFfmpeg([
-          "-i", videoToMux,
-          "-i", audioFile.path,
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c:v", "copy",
-          "-c:a", "libopus",
+          "-i",
+          videoToMux,
+          "-i",
+          audioFile.path,
+          "-map",
+          "0:v:0",
+          "-map",
+          "1:a:0",
+          "-c:v",
+          "copy",
+          "-c:a",
+          "libopus",
           "-y",
           outputPath,
         ]);
       } else {
         // iOS: mp4/mov + mp3 → mp4 (AAC audio for compatibility)
         await runFfmpeg([
-          "-i", videoToMux,
-          "-i", audioFile.path,
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c:v", "copy",
-          "-c:a", "aac",
-          "-map_metadata", "0",
+          "-i",
+          videoToMux,
+          "-i",
+          audioFile.path,
+          "-map",
+          "0:v:0",
+          "-map",
+          "1:a:0",
+          "-c:v",
+          "copy",
+          "-c:a",
+          "aac",
+          "-map_metadata",
+          "0",
           "-y",
           outputPath,
         ]);
@@ -214,7 +238,7 @@ app.post(
       if (!res.headersSent)
         res.status(500).json({ error: err.message ?? "서버 오류" });
     }
-  }
+  },
 );
 
 // Multer error handler
