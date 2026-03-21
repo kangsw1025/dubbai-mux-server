@@ -9,6 +9,15 @@ const app = express();
 const port = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.MUX_AUTH_TOKEN;
 
+// CORS 허용
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 // 멀티파트 업로드: 메모리 저장 (파일 크기 제한 500MB)
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -31,6 +40,75 @@ function runFfmpeg(args) {
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
+
+/**
+ * POST /extract-audio
+ * iOS용: 원본 영상에서 startTime 기준 1분 오디오 추출
+ * Form fields:
+ *   - video: 원본 영상 파일
+ *   - startTime: 시작 시간(초)
+ * Header:
+ *   - Authorization: Bearer <MUX_AUTH_TOKEN>
+ */
+app.post(
+  "/extract-audio",
+  upload.fields([{ name: "video" }]),
+  async (req, res) => {
+    if (AUTH_TOKEN) {
+      const authHeader = req.headers["authorization"] ?? "";
+      if (authHeader !== `Bearer ${AUTH_TOKEN}`) {
+        return res.status(401).json({ error: "Unauthorized" });
+      }
+    }
+
+    const videoFile = req.files?.["video"]?.[0];
+    if (!videoFile) {
+      return res.status(400).json({ error: "video가 필요합니다." });
+    }
+
+    const ts = Date.now();
+    const videoExt = (
+      videoFile.originalname.split(".").pop() ?? "mp4"
+    ).toLowerCase();
+    const videoPath = join(tmpdir(), `extract-video-${ts}.${videoExt}`);
+    const audioPath = join(tmpdir(), `extract-audio-${ts}.mp3`);
+    const tempPaths = [videoPath, audioPath];
+
+    try {
+      await writeFile(videoPath, videoFile.buffer);
+
+      const startTime = parseFloat(req.body?.startTime) || 0;
+
+      await runFfmpeg([
+        "-ss",
+        String(startTime),
+        "-i",
+        videoPath,
+        "-t",
+        "60",
+        "-vn",
+        "-acodec",
+        "mp3",
+        "-y",
+        audioPath,
+      ]);
+
+      const audioBuffer = await readFile(audioPath);
+
+      res.set({
+        "Content-Type": "audio/mpeg",
+        "Content-Disposition": 'attachment; filename="extracted.mp3"',
+        "Content-Length": String(audioBuffer.length),
+      });
+      res.send(audioBuffer);
+    } catch (err) {
+      console.error("[extract-audio error]", err);
+      res.status(500).json({ error: err.message ?? "서버 오류" });
+    } finally {
+      await Promise.allSettled(tempPaths.map((p) => unlink(p).catch(() => {})));
+    }
+  },
+);
 
 /**
  * POST /mux
