@@ -59,7 +59,7 @@ function runFfmpeg(args) {
 
 async function cleanupFiles(paths) {
   await Promise.allSettled(
-    paths.filter(Boolean).map((p) => unlink(p).catch(() => {}))
+    paths.filter(Boolean).map((p) => unlink(p).catch(() => {})),
   );
 }
 
@@ -88,75 +88,72 @@ app.get("/health", (_req, res) => {
  *   - startTime: 시작 시간(초)
  * Response: audio/mpeg (+ X-Session-Id 헤더)
  */
-app.post(
-  "/prepare",
-  upload.fields([{ name: "video" }]),
-  async (req, res) => {
-    if (!checkAuth(req, res)) return;
+app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
+  if (!checkAuth(req, res)) return;
 
-    const videoFile = req.files?.["video"]?.[0];
-    if (!videoFile) {
-      return res.status(400).json({ error: "video가 필요합니다." });
-    }
-
-    const sessionId = crypto.randomUUID();
-    const videoExt = (
-      videoFile.originalname.split(".").pop() ?? "mp4"
-    ).toLowerCase();
-
-    // 영상을 세션 경로로 이동 (multer가 이미 tmpdir에 저장함)
-    const sessionVideoPath = join(
-      tmpdir(),
-      `session-${sessionId}.${videoExt}`
-    );
-
-    const audioPath = join(tmpdir(), `prepare-audio-${sessionId}.mp3`);
-
-    try {
-      // multer 업로드 파일을 세션 경로로 rename
-      const { rename } = require("fs/promises");
-      await rename(videoFile.path, sessionVideoPath);
-
-      const startTime = parseFloat(req.body?.startTime) || 0;
-
-      await runFfmpeg([
-        "-ss", String(startTime),
-        "-i", sessionVideoPath,
-        "-t", "60",
-        "-vn",
-        "-acodec", "mp3",
-        "-y",
-        audioPath,
-      ]);
-
-      // 10분 후 세션 자동 만료
-      const timer = setTimeout(() => {
-        deleteSession(sessionId);
-        unlink(audioPath).catch(() => {});
-      }, SESSION_TTL_MS);
-
-      sessions.set(sessionId, { videoPath: sessionVideoPath, videoExt, timer });
-
-      res.set({
-        "Content-Type": "audio/mpeg",
-        "Content-Disposition": 'attachment; filename="extracted.mp3"',
-        "X-Session-Id": sessionId,
-        "Access-Control-Expose-Headers": "X-Session-Id",
-      });
-
-      res.sendFile(audioPath, { root: "/" }, async (err) => {
-        if (err && !res.headersSent) res.status(500).end();
-        await unlink(audioPath).catch(() => {});
-      });
-    } catch (err) {
-      console.error("[prepare error]", err);
-      await cleanupFiles([audioPath, sessionVideoPath]);
-      sessions.delete(sessionId);
-      if (!res.headersSent)
-        res.status(500).json({ error: err.message ?? "서버 오류" });
-    }
+  const videoFile = req.files?.["video"]?.[0];
+  if (!videoFile) {
+    return res.status(400).json({ error: "video가 필요합니다." });
   }
-);
+
+  const sessionId = crypto.randomUUID();
+  const videoExt = (
+    videoFile.originalname.split(".").pop() ?? "mp4"
+  ).toLowerCase();
+
+  // 영상을 세션 경로로 이동 (multer가 이미 tmpdir에 저장함)
+  const sessionVideoPath = join(tmpdir(), `session-${sessionId}.${videoExt}`);
+
+  const audioPath = join(tmpdir(), `prepare-audio-${sessionId}.mp3`);
+
+  try {
+    // multer 업로드 파일을 세션 경로로 rename
+    const { rename } = require("fs/promises");
+    await rename(videoFile.path, sessionVideoPath);
+
+    const startTime = parseFloat(req.body?.startTime) || 0;
+
+    await runFfmpeg([
+      "-ss",
+      String(startTime),
+      "-i",
+      sessionVideoPath,
+      "-t",
+      "60",
+      "-vn",
+      "-acodec",
+      "mp3",
+      "-y",
+      audioPath,
+    ]);
+
+    // 10분 후 세션 자동 만료
+    const timer = setTimeout(() => {
+      deleteSession(sessionId);
+      unlink(audioPath).catch(() => {});
+    }, SESSION_TTL_MS);
+
+    sessions.set(sessionId, { videoPath: sessionVideoPath, videoExt, timer });
+
+    res.set({
+      "Content-Type": "audio/mpeg",
+      "Content-Disposition": 'attachment; filename="extracted.mp3"',
+      "X-Session-Id": sessionId,
+      "Access-Control-Expose-Headers": "X-Session-Id",
+    });
+
+    res.sendFile(audioPath, { root: "/" }, async (err) => {
+      if (err && !res.headersSent) res.status(500).end();
+      await unlink(audioPath).catch(() => {});
+    });
+  } catch (err) {
+    console.error("[prepare error]", err);
+    await cleanupFiles([audioPath, sessionVideoPath]);
+    sessions.delete(sessionId);
+    if (!res.headersSent)
+      res.status(500).json({ error: err.message ?? "서버 오류" });
+  }
+});
 
 /**
  * POST /mux-session
@@ -181,7 +178,9 @@ app.post(
 
     const session = sessions.get(sessionId);
     if (!session) {
-      return res.status(404).json({ error: "세션이 만료되었거나 존재하지 않습니다." });
+      return res
+        .status(404)
+        .json({ error: "세션이 만료되었거나 존재하지 않습니다." });
     }
 
     const { videoPath, videoExt } = session;
@@ -194,12 +193,18 @@ app.post(
       tempPaths.push(clippedPath);
 
       await runFfmpeg([
-        "-ss", String(startTime),
-        "-i", videoPath,
-        "-t", "60",
-        "-c:v", "copy",
-        "-c:a", "copy",
-        "-map_metadata", "0",
+        "-ss",
+        String(startTime),
+        "-i",
+        videoPath,
+        "-t",
+        "60",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-map_metadata",
+        "0",
         "-y",
         clippedPath,
       ]);
@@ -211,24 +216,41 @@ app.post(
 
       if (isWebm) {
         await runFfmpeg([
-          "-i", clippedPath,
-          "-i", audioFile.path,
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c:v", "copy",
-          "-c:a", "libopus",
+          "-i",
+          clippedPath,
+          "-i",
+          audioFile.path,
+          "-map",
+          "0:v:0",
+          "-map",
+          "1:a:0",
+          "-c:v",
+          "copy",
+          "-c:a",
+          "libopus",
           "-y",
           outputPath,
         ]);
       } else {
         await runFfmpeg([
-          "-i", clippedPath,
-          "-i", audioFile.path,
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c:v", "copy",
-          "-c:a", "aac",
-          "-map_metadata", "0",
+          "-i",
+          clippedPath,
+          "-i",
+          audioFile.path,
+          "-map",
+          "0:v:0",
+          "-map",
+          "1:a:0",
+          "-c:v",
+          "libx264",
+          "-preset",
+          "fast",
+          "-crf",
+          "23",
+          "-c:a",
+          "aac",
+          "-map_metadata",
+          "0",
           "-y",
           outputPath,
         ]);
@@ -254,7 +276,7 @@ app.post(
       if (!res.headersSent)
         res.status(500).json({ error: err.message ?? "서버 오류" });
     }
-  }
+  },
 );
 
 /**
@@ -291,24 +313,37 @@ app.post(
 
       if (isWebm) {
         await runFfmpeg([
-          "-i", videoFile.path,
-          "-i", audioFile.path,
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c:v", "copy",
-          "-c:a", "libopus",
+          "-i",
+          videoFile.path,
+          "-i",
+          audioFile.path,
+          "-map",
+          "0:v:0",
+          "-map",
+          "1:a:0",
+          "-c:v",
+          "copy",
+          "-c:a",
+          "libopus",
           "-y",
           outputPath,
         ]);
       } else {
         await runFfmpeg([
-          "-i", videoFile.path,
-          "-i", audioFile.path,
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c:v", "copy",
-          "-c:a", "aac",
-          "-map_metadata", "0",
+          "-i",
+          videoFile.path,
+          "-i",
+          audioFile.path,
+          "-map",
+          "0:v:0",
+          "-map",
+          "1:a:0",
+          "-c:v",
+          "copy",
+          "-c:a",
+          "aac",
+          "-map_metadata",
+          "0",
           "-y",
           outputPath,
         ]);
@@ -330,7 +365,7 @@ app.post(
       if (!res.headersSent)
         res.status(500).json({ error: err.message ?? "서버 오류" });
     }
-  }
+  },
 );
 
 // Multer error handler
