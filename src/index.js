@@ -5,7 +5,7 @@ const { unlink } = require("fs/promises");
 const { join } = require("path");
 const { tmpdir } = require("os");
 const crypto = require("crypto");
-const ffmpegPath = require("ffmpeg-static");
+const ffmpegPath = "ffmpeg";
 
 const app = express();
 const port = process.env.PORT || 3000;
