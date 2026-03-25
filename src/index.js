@@ -82,10 +82,11 @@ app.get("/health", (_req, res) => {
  * POST /prepare
  * iOS용: 원본 영상을 한 번만 업로드
  *   1) 영상을 세션으로 보관
- *   2) startTime 기준 1분 오디오 추출 후 반환
+ *   2) startTime ~ endTime 기준 오디오 추출 후 반환
  * Form fields:
  *   - video: 원본 영상
  *   - startTime: 시작 시간(초)
+ *   - endTime: 종료 시간(초, optional)
  * Response: audio/mpeg (+ X-Session-Id 헤더)
  */
 app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
@@ -112,6 +113,9 @@ app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
     await rename(videoFile.path, sessionVideoPath);
 
     const startTime = parseFloat(req.body?.startTime) || 0;
+    const endTime = parseFloat(req.body?.endTime);
+    const duration =
+      Number.isFinite(endTime) && endTime > startTime ? endTime - startTime : 60;
 
     await runFfmpeg([
       "-ss",
@@ -119,7 +123,7 @@ app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
       "-i",
       sessionVideoPath,
       "-t",
-      "60",
+      String(duration),
       "-vn",
       "-acodec",
       "mp3",
@@ -162,6 +166,7 @@ app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
  *   - audio: 더빙 오디오 (mp3)
  *   - sessionId: /prepare에서 받은 세션 ID
  *   - startTime: 시작 시간(초)
+ *   - endTime: 종료 시간(초, optional)
  */
 app.post(
   "/mux-session",
@@ -183,31 +188,16 @@ app.post(
         .json({ error: "세션이 만료되었거나 존재하지 않습니다." });
     }
 
+    deleteSession(sessionId); // 즉시 제거 (이중 호출 방지)
     const { videoPath, videoExt } = session;
     const id = crypto.randomUUID();
     const tempPaths = [audioFile.path];
 
     try {
       const startTime = parseFloat(req.body?.startTime) || 0;
-      const clippedPath = join(tmpdir(), `mux-clip-${id}.${videoExt}`);
-      tempPaths.push(clippedPath);
-
-      await runFfmpeg([
-        "-ss",
-        String(startTime),
-        "-i",
-        videoPath,
-        "-t",
-        "60",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "copy",
-        "-map_metadata",
-        "0",
-        "-y",
-        clippedPath,
-      ]);
+      const endTime = parseFloat(req.body?.endTime);
+      const duration =
+        Number.isFinite(endTime) && endTime > startTime ? endTime - startTime : 60;
 
       const isWebm = videoExt === "webm";
       const outputExt = isWebm ? "webm" : "mp4";
@@ -216,8 +206,12 @@ app.post(
 
       if (isWebm) {
         await runFfmpeg([
+          "-ss",
+          String(startTime),
           "-i",
-          clippedPath,
+          videoPath,
+          "-t",
+          String(duration),
           "-i",
           audioFile.path,
           "-map",
@@ -228,13 +222,18 @@ app.post(
           "copy",
           "-c:a",
           "libopus",
+          "-shortest",
           "-y",
           outputPath,
         ]);
       } else {
         await runFfmpeg([
+          "-ss",
+          String(startTime),
           "-i",
-          clippedPath,
+          videoPath,
+          "-t",
+          String(duration),
           "-i",
           audioFile.path,
           "-map",
@@ -249,15 +248,14 @@ app.post(
           "23",
           "-c:a",
           "aac",
+          "-noautorotate",
+          "-shortest",
           "-map_metadata",
           "0",
           "-y",
           outputPath,
         ]);
       }
-
-      // 세션 정리 (영상 삭제)
-      deleteSession(sessionId);
 
       const mimeType = isWebm ? "video/webm" : "video/mp4";
       res.set({
