@@ -84,6 +84,13 @@ function normalizeContainer(container) {
   return value === "webm" ? "webm" : "mp4";
 }
 
+function detectContainerFromUpload(file) {
+  const ext = (file?.originalname?.split(".").pop() ?? "").toLowerCase();
+  const mime = String(file?.mimetype ?? "").toLowerCase();
+  if (mime.includes("webm") || ext === "webm") return "webm";
+  return "mp4";
+}
+
 // 세션 저장소: sessionId → { videoPath, videoExt, timer }
 const sessions = new Map();
 // 클립 세션 저장소: sessionId → { clipPath, container, nextSeq, totalBytes, completed, timer }
@@ -406,10 +413,10 @@ app.post(
         await runFfmpeg([
           "-ss",
           String(startTime),
-          "-i",
-          videoPath,
           "-t",
           String(duration),
+          "-i",
+          videoPath,
           "-i",
           audioFile.path,
           "-map",
@@ -428,10 +435,11 @@ app.post(
         await runFfmpeg([
           "-ss",
           String(startTime),
-          "-i",
-          videoPath,
           "-t",
           String(duration),
+          "-noautorotate",
+          "-i",
+          videoPath,
           "-i",
           audioFile.path,
           "-map",
@@ -446,7 +454,6 @@ app.post(
           "23",
           "-c:a",
           "aac",
-          "-noautorotate",
           "-shortest",
           "-map_metadata",
           "0",
@@ -627,13 +634,11 @@ app.post(
     }
 
     const id = crypto.randomUUID();
-    const videoExt = (
-      videoFile.originalname.split(".").pop() ?? "webm"
-    ).toLowerCase();
+    const container = detectContainerFromUpload(videoFile);
     const tempPaths = [videoFile.path, audioFile.path];
 
     try {
-      const isWebm = videoExt === "webm";
+      const isWebm = container === "webm";
       const outputExt = isWebm ? "webm" : "mp4";
       const outputPath = join(tmpdir(), `mux-output-${id}.${outputExt}`);
       tempPaths.push(outputPath);
@@ -652,28 +657,61 @@ app.post(
           "copy",
           "-c:a",
           "libopus",
+          "-shortest",
           "-y",
           outputPath,
         ]);
       } else {
-        await runFfmpeg([
-          "-i",
-          videoFile.path,
-          "-i",
-          audioFile.path,
-          "-map",
-          "0:v:0",
-          "-map",
-          "1:a:0",
-          "-c:v",
-          "copy",
-          "-c:a",
-          "aac",
-          "-map_metadata",
-          "0",
-          "-y",
-          outputPath,
-        ]);
+        try {
+          await runFfmpeg([
+            "-i",
+            videoFile.path,
+            "-i",
+            audioFile.path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            "-map_metadata",
+            "0",
+            "-y",
+            outputPath,
+          ]);
+        } catch {
+          // copy 불가 시 재인코딩 fallback
+          await runFfmpeg([
+            "-i",
+            videoFile.path,
+            "-i",
+            audioFile.path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            "-map_metadata",
+            "0",
+            "-y",
+            outputPath,
+          ]);
+        }
       }
 
       const mimeType = isWebm ? "video/webm" : "video/mp4";
