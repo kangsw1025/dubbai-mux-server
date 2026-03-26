@@ -267,6 +267,61 @@ app.post("/clip-session/complete", (req, res) => {
 });
 
 /**
+ * POST /clip-session/extract-audio
+ * iOS용: 완료된 클립 세션 영상에서 오디오(mp3) 추출
+ * Body(JSON):
+ *   - sessionId
+ */
+app.post("/clip-session/extract-audio", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+
+  const sessionId = req.body?.sessionId;
+  if (!sessionId) {
+    return res.status(400).json({ error: "sessionId가 필요합니다." });
+  }
+
+  const session = clipSessions.get(sessionId);
+  if (!session) {
+    return res
+      .status(404)
+      .json({ error: "클립 세션이 만료되었거나 존재하지 않습니다." });
+  }
+
+  if (!session.completed) {
+    return res.status(409).json({ error: "클립 업로드가 완료되지 않았습니다." });
+  }
+
+  const outputPath = join(tmpdir(), `clip-audio-${crypto.randomUUID()}.mp3`);
+
+  try {
+    await runFfmpeg([
+      "-i",
+      session.clipPath,
+      "-vn",
+      "-acodec",
+      "mp3",
+      "-y",
+      outputPath,
+    ]);
+
+    res.set({
+      "Content-Type": "audio/mpeg",
+      "Content-Disposition": 'attachment; filename="clip-audio.mp3"',
+    });
+
+    res.sendFile(outputPath, { root: "/" }, async (err) => {
+      if (err && !res.headersSent) res.status(500).end();
+      await cleanupFiles([outputPath]);
+    });
+  } catch (err) {
+    console.error("[clip-session/extract-audio error]", err);
+    await cleanupFiles([outputPath]);
+    if (!res.headersSent)
+      res.status(500).json({ error: err.message ?? "서버 오류" });
+  }
+});
+
+/**
  * POST /clip-session/abort
  * iOS용: 실패 시 업로드 세션 즉시 정리
  * Body(JSON):
