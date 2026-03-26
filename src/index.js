@@ -226,7 +226,9 @@ app.post(
           "copy",
           "-c:a",
           "libopus",
-          "-shortest",
+          // 출력 길이를 선택 구간(duration)으로 고정
+          "-t",
+          String(duration),
           "-y",
           outputPath,
         ]);
@@ -253,7 +255,9 @@ app.post(
           "23",
           "-c:a",
           "aac",
-          "-shortest",
+          // 출력 길이를 선택 구간(duration)으로 고정
+          "-t",
+          String(duration),
           "-map_metadata",
           "0",
           "-y",
