@@ -66,12 +66,15 @@ async function cleanupFiles(paths) {
 // 세션 저장소: sessionId → { videoPath, videoExt, timer }
 const sessions = new Map();
 
-function deleteSession(sessionId) {
+function deleteSession(sessionId, options = {}) {
+  const { removeFile = true } = options;
   const session = sessions.get(sessionId);
   if (!session) return;
   clearTimeout(session.timer);
   sessions.delete(sessionId);
-  unlink(session.videoPath).catch(() => {});
+  if (removeFile) {
+    unlink(session.videoPath).catch(() => {});
+  }
 }
 
 app.get("/health", (_req, res) => {
@@ -188,10 +191,11 @@ app.post(
         .json({ error: "세션이 만료되었거나 존재하지 않습니다." });
     }
 
-    deleteSession(sessionId); // 즉시 제거 (이중 호출 방지)
+    // 세션 맵에서는 제거하되, ffmpeg가 읽을 수 있게 파일 삭제는 뒤로 미룸
+    deleteSession(sessionId, { removeFile: false });
     const { videoPath, videoExt } = session;
     const id = crypto.randomUUID();
-    const tempPaths = [audioFile.path];
+    const tempPaths = [audioFile.path, videoPath];
 
     try {
       const startTime = parseFloat(req.body?.startTime) || 0;
@@ -208,10 +212,10 @@ app.post(
         await runFfmpeg([
           "-ss",
           String(startTime),
-          "-i",
-          videoPath,
           "-t",
           String(duration),
+          "-i",
+          videoPath,
           "-i",
           audioFile.path,
           "-map",
@@ -230,10 +234,11 @@ app.post(
         await runFfmpeg([
           "-ss",
           String(startTime),
-          "-i",
-          videoPath,
           "-t",
           String(duration),
+          "-noautorotate",
+          "-i",
+          videoPath,
           "-i",
           audioFile.path,
           "-map",
@@ -248,7 +253,6 @@ app.post(
           "23",
           "-c:a",
           "aac",
-          "-noautorotate",
           "-shortest",
           "-map_metadata",
           "0",
@@ -269,7 +273,6 @@ app.post(
       });
     } catch (err) {
       console.error("[mux-session error]", err);
-      deleteSession(sessionId);
       await cleanupFiles(tempPaths);
       if (!res.headersSent)
         res.status(500).json({ error: err.message ?? "서버 오류" });
