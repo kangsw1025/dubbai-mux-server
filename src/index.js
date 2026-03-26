@@ -381,7 +381,7 @@ app.post(
         ];
 
         if (movInput) {
-          // iPhone MOV 호환성: 짝수 해상도 + yuv420p 강제
+          // iPhone MOV 호환성 + 서버 안정성: 720p/30fps로 다운스케일
           const mapIndex = mp4Args.indexOf("-map_metadata");
           mp4Args.splice(
             mapIndex,
@@ -389,7 +389,7 @@ app.post(
             "-af",
             "apad",
             "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "scale=-2:720,format=yuv420p,fps=30",
             "-pix_fmt",
             "yuv420p",
           );
