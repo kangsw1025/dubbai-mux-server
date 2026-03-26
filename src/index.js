@@ -57,6 +57,63 @@ function runFfmpeg(args) {
   });
 }
 
+function runFfprobe(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffprobe", args);
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (d) => (stdout += d.toString()));
+    proc.stderr.on("data", (d) => (stderr += d.toString()));
+
+    proc.on("close", (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`ffprobe exited with code ${code}: ${stderr}`));
+    });
+    proc.on("error", reject);
+  });
+}
+
+async function probeMedia(path) {
+  try {
+    const raw = await runFfprobe([
+      "-v",
+      "error",
+      "-show_entries",
+      "stream=codec_type,codec_name:format=duration",
+      "-of",
+      "json",
+      path,
+    ]);
+    const json = JSON.parse(raw);
+    const streams = Array.isArray(json.streams) ? json.streams : [];
+    const video = streams.find((s) => s.codec_type === "video");
+    const audio = streams.find((s) => s.codec_type === "audio");
+    return {
+      videoCodec: video?.codec_name ?? "unknown",
+      audioCodec: audio?.codec_name ?? "unknown",
+      duration: Number.parseFloat(json?.format?.duration ?? "0") || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function summarizeFfmpegError(err) {
+  const message = err instanceof Error ? err.message : String(err);
+  const lines = message
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const tail = lines.slice(-6).join(" | ");
+  if (!tail) return "ffmpeg 처리 실패";
+  return tail.length > 1000 ? `${tail.slice(0, 1000)}...` : tail;
+}
+
+function isMovInput(videoExt, videoMime = "") {
+  return videoExt === "mov" || String(videoMime).includes("quicktime");
+}
+
 async function cleanupFiles(paths) {
   await Promise.allSettled(
     paths.filter(Boolean).map((p) => unlink(p).catch(() => {})),
@@ -104,6 +161,8 @@ app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
   const videoExt = (
     videoFile.originalname.split(".").pop() ?? "mp4"
   ).toLowerCase();
+  const videoMime = String(videoFile.mimetype ?? "").toLowerCase();
+  const movInput = isMovInput(videoExt, videoMime);
 
   // 영상을 세션 경로로 이동 (multer가 이미 tmpdir에 저장함)
   const sessionVideoPath = join(tmpdir(), `session-${sessionId}.${videoExt}`);
@@ -120,19 +179,52 @@ app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
     const duration =
       Number.isFinite(endTime) && endTime > startTime ? endTime - startTime : 60;
 
-    await runFfmpeg([
-      "-ss",
-      String(startTime),
-      "-i",
-      sessionVideoPath,
-      "-t",
-      String(duration),
-      "-vn",
-      "-acodec",
-      "mp3",
-      "-y",
-      audioPath,
-    ]);
+    console.info("[prepare]", {
+      sessionId,
+      inputExt: videoExt,
+      mime: videoMime,
+      startTime,
+      duration,
+    });
+
+    try {
+      await runFfmpeg([
+        "-ss",
+        String(startTime),
+        "-t",
+        String(duration),
+        "-i",
+        sessionVideoPath,
+        "-vn",
+        "-acodec",
+        "mp3",
+        "-y",
+        audioPath,
+      ]);
+    } catch (primaryErr) {
+      if (!movInput) throw primaryErr;
+
+      // MOV 입력은 optional map 재시도로 오디오 추출 호환성 보강
+      console.warn("[prepare] mov audio extract primary failed, retrying", {
+        sessionId,
+        reason: summarizeFfmpegError(primaryErr),
+      });
+      await runFfmpeg([
+        "-ss",
+        String(startTime),
+        "-t",
+        String(duration),
+        "-i",
+        sessionVideoPath,
+        "-map",
+        "0:a:0?",
+        "-vn",
+        "-c:a",
+        "mp3",
+        "-y",
+        audioPath,
+      ]);
+    }
 
     // 10분 후 세션 자동 만료
     const timer = setTimeout(() => {
@@ -140,7 +232,12 @@ app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
       unlink(audioPath).catch(() => {});
     }, SESSION_TTL_MS);
 
-    sessions.set(sessionId, { videoPath: sessionVideoPath, videoExt, timer });
+    sessions.set(sessionId, {
+      videoPath: sessionVideoPath,
+      videoExt,
+      videoMime,
+      timer,
+    });
 
     res.set({
       "Content-Type": "audio/mpeg",
@@ -157,8 +254,11 @@ app.post("/prepare", upload.fields([{ name: "video" }]), async (req, res) => {
     console.error("[prepare error]", err);
     await cleanupFiles([audioPath, sessionVideoPath]);
     sessions.delete(sessionId);
-    if (!res.headersSent)
-      res.status(500).json({ error: err.message ?? "서버 오류" });
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: summarizeFfmpegError(err),
+      });
+    }
   }
 });
 
@@ -193,7 +293,7 @@ app.post(
 
     // 세션 맵에서는 제거하되, ffmpeg가 읽을 수 있게 파일 삭제는 뒤로 미룸
     deleteSession(sessionId, { removeFile: false });
-    const { videoPath, videoExt } = session;
+    const { videoPath, videoExt, videoMime } = session;
     const id = crypto.randomUUID();
     const tempPaths = [audioFile.path, videoPath];
 
@@ -204,9 +304,23 @@ app.post(
         Number.isFinite(endTime) && endTime > startTime ? endTime - startTime : 60;
 
       const isWebm = videoExt === "webm";
+      const movInput = isMovInput(videoExt, videoMime);
       const outputExt = isWebm ? "webm" : "mp4";
       const outputPath = join(tmpdir(), `mux-output-${id}.${outputExt}`);
       tempPaths.push(outputPath);
+
+      const videoMeta = await probeMedia(videoPath);
+      const audioMeta = await probeMedia(audioFile.path);
+      console.info("[mux-session]", {
+        sessionId,
+        inputExt: videoExt,
+        mime: videoMime ?? "",
+        startTime,
+        duration,
+        videoCodec: videoMeta?.videoCodec ?? "unknown",
+        audioCodec: audioMeta?.audioCodec ?? "unknown",
+        inputDuration: videoMeta?.duration ?? 0,
+      });
 
       if (isWebm) {
         await runFfmpeg([
@@ -233,7 +347,7 @@ app.post(
           outputPath,
         ]);
       } else {
-        await runFfmpeg([
+        const mp4Args = [
           "-ss",
           String(startTime),
           "-t",
@@ -258,11 +372,30 @@ app.post(
           // 출력 길이를 선택 구간(duration)으로 고정
           "-t",
           String(duration),
+          "-movflags",
+          "+faststart",
           "-map_metadata",
           "0",
           "-y",
           outputPath,
-        ]);
+        ];
+
+        if (movInput) {
+          // iPhone MOV 호환성: 짝수 해상도 + yuv420p 강제
+          const mapIndex = mp4Args.indexOf("-map_metadata");
+          mp4Args.splice(
+            mapIndex,
+            0,
+            "-af",
+            "apad",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "-pix_fmt",
+            "yuv420p",
+          );
+        }
+
+        await runFfmpeg(mp4Args);
       }
 
       const mimeType = isWebm ? "video/webm" : "video/mp4";
@@ -279,7 +412,7 @@ app.post(
       console.error("[mux-session error]", err);
       await cleanupFiles(tempPaths);
       if (!res.headersSent)
-        res.status(500).json({ error: err.message ?? "서버 오류" });
+        res.status(500).json({ error: summarizeFfmpegError(err) });
     }
   },
 );
